@@ -1,13 +1,15 @@
 package users
 
 import (
+	"encoding/json"
 	"net/http"
-	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/opentap/opentap/internal/auth"
 	"github.com/opentap/opentap/internal/events"
 	"github.com/opentap/opentap/internal/models"
+	"github.com/opentap/opentap/internal/pagination"
 	"github.com/opentap/opentap/pkg/response"
 )
 
@@ -21,97 +23,71 @@ func NewHandler(service Service, eventService events.Service) *Handler {
 }
 
 func (h *Handler) ListUsers(w http.ResponseWriter, r *http.Request) {
-	projectID := r.Context().Value("project_id").(uuid.UUID)
-	params := parseCursorParams(r)
-
-	users, nextCursor, err := h.service.ListUsers(r.Context(), projectID, params)
+	users, nextCursor, err := h.service.ListUsers(r.Context(), auth.ProjectID(r.Context()), pagination.Parse(r))
 	if err != nil {
-		response.Error(w, http.StatusInternalServerError, "internal_error", "Failed to list users")
+		response.Fail(w, err)
 		return
 	}
-
-	if users == nil {
-		users = []*models.User{}
-	}
-
-	response.JSON(w, http.StatusOK, response.PaginatedResponse{
-		Data:       users,
-		NextCursor: nextCursor,
-		HasMore:    nextCursor != "",
-	})
+	response.Paginated(w, users, nextCursor)
 }
 
 func (h *Handler) GetUser(w http.ResponseWriter, r *http.Request) {
-	projectID := r.Context().Value("project_id").(uuid.UUID)
-	userID, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		response.Error(w, http.StatusBadRequest, "bad_request", "Invalid user ID")
-		return
+	user, ok := h.user(w, r)
+	if ok {
+		response.JSON(w, http.StatusOK, user)
 	}
-
-	user, err := h.service.GetUser(r.Context(), projectID, userID)
-	if err != nil {
-		response.Error(w, http.StatusInternalServerError, "internal_error", "Failed to get user")
-		return
-	}
-	if user == nil {
-		response.Error(w, http.StatusNotFound, "not_found", "User not found")
-		return
-	}
-
-	response.JSON(w, http.StatusOK, user)
 }
 
 func (h *Handler) GetUserEvents(w http.ResponseWriter, r *http.Request) {
-	projectID := r.Context().Value("project_id").(uuid.UUID)
-	userUUID, err := uuid.Parse(chi.URLParam(r, "id"))
+	user, ok := h.user(w, r)
+	if !ok {
+		return
+	}
+
+	filters := events.ParseFilters(r)
+	filters.UserID = user.UserID
+	evts, nextCursor, err := h.eventService.ListEvents(r.Context(), user.ProjectID, pagination.Parse(r), filters)
 	if err != nil {
-		response.Error(w, http.StatusBadRequest, "bad_request", "Invalid user ID")
+		response.Fail(w, err)
+		return
+	}
+	response.Paginated(w, evts, nextCursor)
+}
+
+func (h *Handler) Identify(w http.ResponseWriter, r *http.Request) {
+	var req models.IdentifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		response.Error(w, http.StatusBadRequest, "bad_request", "Invalid JSON body")
 		return
 	}
 
-	// Look up user to get the external user_id
-	user, err := h.service.GetUser(r.Context(), projectID, userUUID)
+	merged, err := h.service.Identify(r.Context(), auth.ProjectID(r.Context()), req)
 	if err != nil {
-		response.Error(w, http.StatusInternalServerError, "internal_error", "Failed to get user")
-		return
-	}
-	if user == nil {
-		response.Error(w, http.StatusNotFound, "not_found", "User not found")
+		response.Fail(w, err)
 		return
 	}
 
-	params := parseCursorParams(r)
-	filters := events.EventFilters{
-		EventName: r.URL.Query().Get("event_name"),
-	}
-
-	evts, nextCursor, err := h.eventService.ListUserEvents(r.Context(), projectID, user.UserID, params, filters)
-	if err != nil {
-		response.Error(w, http.StatusInternalServerError, "internal_error", "Failed to list user events")
-		return
-	}
-
-	if evts == nil {
-		evts = []*models.Event{}
-	}
-
-	response.JSON(w, http.StatusOK, response.PaginatedResponse{
-		Data:       evts,
-		NextCursor: nextCursor,
-		HasMore:    nextCursor != "",
+	response.JSON(w, http.StatusOK, map[string]interface{}{
+		"user_id":       req.UserID,
+		"merged_events": merged,
 	})
 }
 
-func parseCursorParams(r *http.Request) models.CursorParams {
-	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 && parsed <= 100 {
-			limit = parsed
-		}
+func (h *Handler) user(w http.ResponseWriter, r *http.Request) (*models.User, bool) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		response.Error(w, http.StatusBadRequest, "bad_request", "Invalid user ID")
+		return nil, false
 	}
-	return models.CursorParams{
-		Cursor: r.URL.Query().Get("cursor"),
-		Limit:  limit,
+
+	user, err := h.service.GetUser(r.Context(), auth.ProjectID(r.Context()), id)
+	if err != nil {
+		response.Fail(w, err)
+		return nil, false
 	}
+	if user == nil {
+		response.Error(w, http.StatusNotFound, "not_found", "User not found")
+		return nil, false
+	}
+	return user, true
 }

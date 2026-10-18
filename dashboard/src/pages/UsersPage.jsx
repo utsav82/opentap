@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api } from '../lib/api';
-import { Card, PageHeader, LoadingSpinner, EmptyState, Badge } from '../components/Card';
+import { Card, PageHeader, LoadingSpinner, EmptyState, Badge, ErrorMessage } from '../components/Card';
 
 function UserDetail() {
   const { id } = useParams();
@@ -9,6 +9,7 @@ function UserDetail() {
   const [user, setUser] = useState(null);
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     async function load() {
@@ -20,7 +21,7 @@ function UserDetail() {
         setUser(u);
         setEvents(evts?.data || []);
       } catch (err) {
-        console.error(err);
+        setError(err.message);
       } finally {
         setLoading(false);
       }
@@ -29,7 +30,7 @@ function UserDetail() {
   }, [id]);
 
   if (loading) return <LoadingSpinner />;
-  if (!user) return <EmptyState message="User not found" />;
+  if (!user) return <ErrorMessage error={error} />;
 
   return (
     <div>
@@ -92,26 +93,30 @@ function UserList() {
   const [loading, setLoading] = useState(true);
   const [cursor, setCursor] = useState('');
   const [hasMore, setHasMore] = useState(false);
+  const [error, setError] = useState(null);
+  const [page, setPage] = useState('');
 
-  const fetchUsers = async (params = {}) => {
+  useEffect(() => {
+    api.listUsers(page ? { limit: '50', cursor: page } : { limit: '50' })
+      .then((res) => {
+        setUsers((prev) => (page ? [...prev, ...(res.data || [])] : res.data || []));
+        setCursor(res.next_cursor || '');
+        setHasMore(res.has_more || false);
+      })
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [page]);
+
+  const loadMore = () => {
     setLoading(true);
-    try {
-      const res = await api.listUsers({ limit: '50', ...params });
-      setUsers(params.cursor ? (prev) => [...prev, ...(res.data || [])] : res.data || []);
-      setCursor(res.next_cursor || '');
-      setHasMore(res.has_more || false);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
+    setError(null);
+    setPage(cursor);
   };
-
-  useEffect(() => { fetchUsers(); }, []);
 
   return (
     <div>
       <PageHeader title="Users" description="All tracked user profiles" />
+      <ErrorMessage error={error} />
       <Card>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -141,11 +146,11 @@ function UserList() {
         </div>
 
         {loading && <LoadingSpinner />}
-        {!loading && users.length === 0 && <EmptyState message="No users yet" />}
+        {!loading && !error && users.length === 0 && <EmptyState message="No users yet" />}
 
         {hasMore && !loading && (
           <div className="p-4 text-center border-t border-gray-100">
-            <button onClick={() => fetchUsers({ cursor })} className="text-sm text-indigo-600 hover:underline font-medium">
+            <button onClick={loadMore} className="text-sm text-indigo-600 hover:underline font-medium">
               Load more
             </button>
           </div>

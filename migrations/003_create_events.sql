@@ -1,3 +1,5 @@
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
 CREATE TABLE IF NOT EXISTS events (
     id UUID DEFAULT uuid_generate_v4(),
     project_id UUID NOT NULL,

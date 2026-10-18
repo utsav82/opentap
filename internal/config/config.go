@@ -16,7 +16,6 @@ type Config struct {
 	NatsMaxBytes         int64
 	RedisURL             string
 	RedisAPIKeyTTL       time.Duration
-	RedisUserCacheTTL    time.Duration
 	RedisSegmentCacheTTL time.Duration
 	APIPort              int
 	APIRateLimit         int
@@ -25,6 +24,9 @@ type Config struct {
 	SchemaFlushInterval  time.Duration
 	DLQMaxRetries        int
 	EventRetentionDays   int
+	AdminToken           string
+	WebhookSecret        string
+	WorkerConcurrency    int
 }
 
 func Load() (*Config, error) {
@@ -43,7 +45,6 @@ func Load() (*Config, error) {
 	cfg.NatsMaxBytes = int64(getEnvInt("NATS_MAX_BYTES", 1073741824))
 	cfg.RedisURL = getEnvStr("REDIS_URL", "redis://localhost:6379/0")
 	cfg.RedisAPIKeyTTL = getEnvDuration("REDIS_API_KEY_TTL", 5*time.Minute)
-	cfg.RedisUserCacheTTL = getEnvDuration("REDIS_USER_CACHE_TTL", 60*time.Second)
 	cfg.RedisSegmentCacheTTL = getEnvDuration("REDIS_SEGMENT_CACHE_TTL", 10*time.Minute)
 	cfg.APIPort = getEnvInt("API_PORT", 8080)
 	cfg.APIRateLimit = getEnvInt("API_RATE_LIMIT", 100)
@@ -52,6 +53,9 @@ func Load() (*Config, error) {
 	cfg.SchemaFlushInterval = getEnvDuration("SCHEMA_FLUSH_INTERVAL", 30*time.Second)
 	cfg.DLQMaxRetries = getEnvInt("DLQ_MAX_RETRIES", 5)
 	cfg.EventRetentionDays = getEnvInt("EVENT_RETENTION_DAYS", 90)
+	cfg.AdminToken = os.Getenv("ADMIN_TOKEN")
+	cfg.WebhookSecret = os.Getenv("WEBHOOK_SECRET")
+	cfg.WorkerConcurrency = getEnvInt("WORKER_CONCURRENCY", 4)
 
 	return cfg, nil
 }

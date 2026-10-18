@@ -1,35 +1,52 @@
 import { useEffect, useState } from 'react';
-import { api, setApiKey, getApiKey } from '../lib/api';
-import { Card, PageHeader, LoadingSpinner, EmptyState, Badge } from '../components/Card';
-import { Plus, Trash2, Key, Copy, Check } from 'lucide-react';
+import { api, setApiKey, getApiKey, setAdminToken, getAdminToken } from '../lib/api';
+import { Card, PageHeader, EmptyState, Badge, ErrorMessage } from '../components/Card';
+import { Plus, Key, Copy, Check, Trash2 } from 'lucide-react';
+
+const input = 'w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none';
 
 export default function SettingsPage() {
   const [projects, setProjects] = useState([]);
   const [selectedProject, setSelectedProject] = useState(null);
   const [keys, setKeys] = useState([]);
-  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const [newProjectName, setNewProjectName] = useState('');
   const [newKeyLabel, setNewKeyLabel] = useState('');
+  const [newKeyScope, setNewKeyScope] = useState('full');
+  const [projectsVersion, setProjectsVersion] = useState(0);
+  const [keysVersion, setKeysVersion] = useState(0);
   const [createdKey, setCreatedKey] = useState(null);
   const [copied, setCopied] = useState(false);
+  const [adminToken, setAdminTokenInput] = useState(getAdminToken());
   const [currentApiKey, setCurrentApiKey] = useState(getApiKey());
 
-  // Load projects
   useEffect(() => {
     api.listProjects()
       .then((res) => {
         const list = res?.data || [];
         setProjects(list);
-        if (list.length > 0 && !selectedProject) {
-          setSelectedProject(list[0]);
-        }
+        setSelectedProject((current) => current || list[0] || null);
+        setError(null);
       })
-      .catch(() => {})
-      .finally(() => setLoading(false));
-  }, []);
+      .catch((err) => setError(err.message));
+  }, [projectsVersion]);
 
-  // Load keys for selected project
-  // Note: no listKeys endpoint in spec, so we show created keys in memory
+  useEffect(() => {
+    if (!selectedProject) return;
+    api.listApiKeys(selectedProject.id)
+      .then((res) => setKeys(res?.data || []))
+      .catch((err) => setError(err.message));
+  }, [selectedProject, keysVersion]);
+
+  const reloadKeys = () => setKeysVersion((v) => v + 1);
+
+  const handleSaveCredentials = (e) => {
+    e.preventDefault();
+    setAdminToken(adminToken.trim());
+    setApiKey(currentApiKey.trim());
+    setProjectsVersion((v) => v + 1);
+  };
+
   const handleCreateProject = async (e) => {
     e.preventDefault();
     if (!newProjectName.trim()) return;
@@ -47,9 +64,20 @@ export default function SettingsPage() {
     e.preventDefault();
     if (!selectedProject) return;
     try {
-      const res = await api.createApiKey(selectedProject.id, newKeyLabel.trim() || 'default');
+      const res = await api.createApiKey(selectedProject.id, newKeyLabel.trim() || 'default', newKeyScope);
       setCreatedKey(res);
       setNewKeyLabel('');
+      reloadKeys();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  const handleRevokeKey = async (key) => {
+    if (!confirm(`Revoke key ${key.key_prefix}…?`)) return;
+    try {
+      await api.revokeApiKey(selectedProject.id, key.id);
+      reloadKeys();
     } catch (err) {
       alert(err.message);
     }
@@ -66,33 +94,26 @@ export default function SettingsPage() {
     setCurrentApiKey(key);
   };
 
-  const handleApiKeyInput = (e) => {
-    const key = e.target.value;
-    setCurrentApiKey(key);
-    setApiKey(key);
-  };
-
-  if (loading) return <LoadingSpinner />;
-
   return (
     <div>
       <PageHeader title="Settings" description="Manage projects and API keys" />
+      <ErrorMessage error={error} />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* API Key Configuration */}
+        {/* Credentials */}
         <Card className="p-5">
-          <h3 className="text-sm font-semibold text-gray-700 mb-3 flex items-center gap-2"><Key size={16} /> Active API Key</h3>
-          <p className="text-xs text-gray-500 mb-3">Set the API key used for all dashboard requests.</p>
-          <input
-            type="text"
-            value={currentApiKey}
-            onChange={handleApiKeyInput}
-            placeholder="ot_..."
-            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm font-mono focus:ring-2 focus:ring-indigo-500 outline-none"
-          />
-          {currentApiKey && (
-            <p className="text-xs text-green-600 mt-2">API key is set</p>
-          )}
+          <h3 className="text-sm font-semibold text-gray-700 mb-3 flex items-center gap-2"><Key size={16} /> Credentials</h3>
+          <form onSubmit={handleSaveCredentials} className="space-y-3">
+            <div>
+              <label className="block text-xs text-gray-500 mb-1">Admin token (manages projects and keys)</label>
+              <input type="password" value={adminToken} onChange={(e) => setAdminTokenInput(e.target.value)} placeholder="ADMIN_TOKEN" className={`${input} font-mono`} />
+            </div>
+            <div>
+              <label className="block text-xs text-gray-500 mb-1">Project API key (used for all analytics data)</label>
+              <input type="text" value={currentApiKey} onChange={(e) => setCurrentApiKey(e.target.value)} placeholder="ot_..." className={`${input} font-mono`} />
+            </div>
+            <button type="submit" className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700">Save</button>
+          </form>
         </Card>
 
         {/* Create Project */}
@@ -104,7 +125,7 @@ export default function SettingsPage() {
               value={newProjectName}
               onChange={(e) => setNewProjectName(e.target.value)}
               placeholder="Project name"
-              className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+              className={`flex-1 ${input}`}
             />
             <button type="submit" className="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700">
               <Plus size={16} />
@@ -150,11 +171,11 @@ export default function SettingsPage() {
         </div>
       </Card>
 
-      {/* Generate API Key */}
+      {/* API Keys */}
       {selectedProject && (
         <Card className="mt-6 p-5">
           <h3 className="text-sm font-semibold text-gray-700 mb-3">
-            Generate API Key for <span className="text-indigo-600">{selectedProject.name}</span>
+            API Keys for <span className="text-indigo-600">{selectedProject.name}</span>
           </h3>
           <form onSubmit={handleCreateKey} className="flex gap-2 mb-4">
             <input
@@ -162,15 +183,20 @@ export default function SettingsPage() {
               value={newKeyLabel}
               onChange={(e) => setNewKeyLabel(e.target.value)}
               placeholder="Key label (e.g. Production)"
-              className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none"
+              className={`flex-1 ${input}`}
             />
+            <select value={newKeyScope} onChange={(e) => setNewKeyScope(e.target.value)}
+              className="px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-indigo-500 outline-none">
+              <option value="full">Full access</option>
+              <option value="ingest">Ingest only (safe for apps)</option>
+            </select>
             <button type="submit" className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700">
               <Key size={14} /> Generate
             </button>
           </form>
 
           {createdKey && (
-            <div className="p-4 bg-green-50 border border-green-200 rounded-lg">
+            <div className="p-4 mb-4 bg-green-50 border border-green-200 rounded-lg">
               <p className="text-sm font-medium text-green-800 mb-2">API Key created! Copy it now — it won't be shown again.</p>
               <div className="flex items-center gap-2">
                 <code className="flex-1 p-2 bg-white border border-green-300 rounded text-xs font-mono break-all">
@@ -179,18 +205,40 @@ export default function SettingsPage() {
                 <button onClick={() => handleCopyKey(createdKey.key)} className="p-2 text-green-600 hover:text-green-800">
                   {copied ? <Check size={16} /> : <Copy size={16} />}
                 </button>
-                <button
-                  onClick={() => handleSetActiveKey(createdKey.key)}
-                  className="px-3 py-1.5 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700"
-                >
-                  Use this key
-                </button>
-              </div>
-              <div className="mt-2 text-xs text-green-700">
-                Prefix: {createdKey.key_prefix} &middot; Label: {createdKey.label}
+                {createdKey.scope !== 'ingest' && (
+                  <button
+                    onClick={() => handleSetActiveKey(createdKey.key)}
+                    className="px-3 py-1.5 bg-green-600 text-white rounded text-xs font-medium hover:bg-green-700"
+                  >
+                    Use this key
+                  </button>
+                )}
               </div>
             </div>
           )}
+
+          <table className="w-full text-sm">
+            <tbody>
+              {keys.map((k) => (
+                <tr key={k.id} className="border-b border-gray-100">
+                  <td className="py-3 font-mono text-xs">{k.key_prefix}…</td>
+                  <td className="py-3 text-gray-600">{k.label || '—'}</td>
+                  <td className="py-3"><Badge variant={k.scope === 'ingest' ? 'info' : 'default'}>{k.scope === 'ingest' ? 'Ingest only' : 'Full access'}</Badge></td>
+                  <td className="py-3 text-gray-500 text-xs">{new Date(k.created_at).toLocaleDateString()}</td>
+                  <td className="py-3 text-right">
+                    {k.revoked_at ? (
+                      <Badge variant="danger">Revoked</Badge>
+                    ) : (
+                      <button onClick={() => handleRevokeKey(k)} className="text-red-400 hover:text-red-600" title="Revoke">
+                        <Trash2 size={14} />
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {keys.length === 0 && <EmptyState message="No keys for this project yet" />}
         </Card>
       )}
     </div>

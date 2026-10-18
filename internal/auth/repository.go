@@ -4,10 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,15 +19,15 @@ import (
 
 type Repository interface {
 	ValidateKey(ctx context.Context, rawKey string) (*models.APIKey, error)
-	CreateKey(ctx context.Context, projectID uuid.UUID, label string) (string, *models.APIKey, error)
+	CreateKey(ctx context.Context, projectID uuid.UUID, label, scope string) (string, *models.APIKey, error)
 	RevokeKey(ctx context.Context, projectID, keyID uuid.UUID) error
 	ListKeys(ctx context.Context, projectID uuid.UUID) ([]*models.APIKey, error)
 }
 
 type postgresRepository struct {
-	pool       *pgxpool.Pool
-	cache      *cache.RedisClient
-	apiKeyTTL  time.Duration
+	pool      *pgxpool.Pool
+	cache     *cache.RedisClient
+	apiKeyTTL time.Duration
 }
 
 func NewRepository(pool *pgxpool.Pool, cache *cache.RedisClient, apiKeyTTL time.Duration) Repository {
@@ -56,10 +56,10 @@ func (r *postgresRepository) ValidateKey(ctx context.Context, rawKey string) (*m
 	// Fallback to DB
 	apiKey := &models.APIKey{}
 	err := r.pool.QueryRow(ctx,
-		`SELECT ak.id, ak.project_id, ak.key_prefix, ak.label, ak.created_at, ak.revoked_at
+		`SELECT ak.id, ak.project_id, ak.key_prefix, ak.label, ak.created_at, ak.revoked_at, ak.scope
 		 FROM api_keys ak WHERE ak.key_hash = $1`,
 		hash,
-	).Scan(&apiKey.ID, &apiKey.ProjectID, &apiKey.KeyPrefix, &apiKey.Label, &apiKey.CreatedAt, &apiKey.RevokedAt)
+	).Scan(&apiKey.ID, &apiKey.ProjectID, &apiKey.KeyPrefix, &apiKey.Label, &apiKey.CreatedAt, &apiKey.RevokedAt, &apiKey.Scope)
 
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -78,8 +78,7 @@ func (r *postgresRepository) ValidateKey(ctx context.Context, rawKey string) (*m
 	return apiKey, nil
 }
 
-func (r *postgresRepository) CreateKey(ctx context.Context, projectID uuid.UUID, label string) (string, *models.APIKey, error) {
-	// Generate random key: ot_ + 43 base62 chars
+func (r *postgresRepository) CreateKey(ctx context.Context, projectID uuid.UUID, label, scope string) (string, *models.APIKey, error) {
 	rawKey, err := generateAPIKey()
 	if err != nil {
 		return "", nil, fmt.Errorf("generate key: %w", err)
@@ -90,9 +89,9 @@ func (r *postgresRepository) CreateKey(ctx context.Context, projectID uuid.UUID,
 
 	apiKey := &models.APIKey{}
 	err = r.pool.QueryRow(ctx,
-		`INSERT INTO api_keys (project_id, key_hash, key_prefix, label, created_at)
-		 VALUES ($1, $2, $3, $4, NOW()) RETURNING id, created_at`,
-		projectID, hash, prefix, label,
+		`INSERT INTO api_keys (project_id, key_hash, key_prefix, label, scope, created_at)
+		 VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING id, created_at`,
+		projectID, hash, prefix, label, scope,
 	).Scan(&apiKey.ID, &apiKey.CreatedAt)
 
 	if err != nil {
@@ -102,6 +101,7 @@ func (r *postgresRepository) CreateKey(ctx context.Context, projectID uuid.UUID,
 	apiKey.ProjectID = projectID
 	apiKey.KeyPrefix = prefix
 	apiKey.Label = label
+	apiKey.Scope = scope
 
 	return rawKey, apiKey, nil
 }
@@ -117,7 +117,7 @@ func (r *postgresRepository) RevokeKey(ctx context.Context, projectID, keyID uui
 	).Scan(&keyHash)
 
 	if err == pgx.ErrNoRows {
-		return fmt.Errorf("key not found or already revoked")
+		return fmt.Errorf("active api key %w", models.ErrNotFound)
 	}
 	if err != nil {
 		return err
@@ -133,40 +133,25 @@ func (r *postgresRepository) RevokeKey(ctx context.Context, projectID, keyID uui
 }
 
 func (r *postgresRepository) ListKeys(ctx context.Context, projectID uuid.UUID) ([]*models.APIKey, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT id, project_id, key_prefix, label, created_at, revoked_at
+	rows, _ := r.pool.Query(ctx,
+		`SELECT id, project_id, key_prefix, label, created_at, revoked_at, scope
 		 FROM api_keys WHERE project_id = $1 ORDER BY created_at DESC`,
 		projectID,
 	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var keys []*models.APIKey
-	for rows.Next() {
-		k := &models.APIKey{}
-		if err := rows.Scan(&k.ID, &k.ProjectID, &k.KeyPrefix, &k.Label, &k.CreatedAt, &k.RevokedAt); err != nil {
-			return nil, err
-		}
-		keys = append(keys, k)
-	}
-	return keys, nil
+	return pgx.CollectRows(rows, pgx.RowToAddrOfStructByPos[models.APIKey])
 }
 
 func generateAPIKey() (string, error) {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
+	key := make([]byte, 43)
+	for i := range key {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", err
+		}
+		key[i] = charset[n.Int64()]
 	}
-	// Encode to base62-like string
-	encoded := base64.RawURLEncoding.EncodeToString(b)
-	// Trim to 43 chars and prepend prefix
-	if len(encoded) > 43 {
-		encoded = encoded[:43]
-	}
-	return "ot_" + encoded, nil
+	return "ot_" + string(key), nil
 }
 
 func hashKey(rawKey string) string {

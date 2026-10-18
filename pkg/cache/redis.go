@@ -35,18 +35,6 @@ func (r *RedisClient) Delete(ctx context.Context, key string) error {
 	return r.Client.Del(ctx, key).Err()
 }
 
-func (r *RedisClient) Incr(ctx context.Context, key string) (int64, error) {
-	return r.Client.Incr(ctx, key).Result()
-}
-
-func (r *RedisClient) Expire(ctx context.Context, key string, ttl time.Duration) error {
-	return r.Client.Expire(ctx, key, ttl).Err()
-}
-
-func (r *RedisClient) TTL(ctx context.Context, key string) (time.Duration, error) {
-	return r.Client.TTL(ctx, key).Result()
-}
-
 func (r *RedisClient) Close() error {
 	return r.Client.Close()
 }

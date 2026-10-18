@@ -6,12 +6,14 @@ import {
   Filter,
   Database,
   Settings,
+  BarChart3,
 } from 'lucide-react';
 
 const navItems = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard' },
   { to: '/events', icon: Zap, label: 'Events' },
   { to: '/users', icon: Users, label: 'Users' },
+  { to: '/analytics', icon: BarChart3, label: 'Analytics' },
   { to: '/segments', icon: Filter, label: 'Segments' },
   { to: '/schemas', icon: Database, label: 'Schemas' },
   { to: '/settings', icon: Settings, label: 'Settings' },

@@ -3,22 +3,24 @@ import {
   AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
 } from 'recharts';
-import { Zap, Users, TrendingUp, Activity } from 'lucide-react';
+import { Zap, Users, TrendingUp } from 'lucide-react';
 import { api } from '../lib/api';
-import { Card, StatCard, PageHeader, LoadingSpinner } from '../components/Card';
+import { Card, StatCard, PageHeader, LoadingSpinner, ErrorMessage } from '../components/Card';
 
 export default function DashboardPage() {
   const [dauData, setDauData] = useState([]);
   const [topEvents, setTopEvents] = useState([]);
+  const [totalEvents, setTotalEvents] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
   useEffect(() => {
     async function load() {
       try {
-        const [dau, top] = await Promise.all([
+        const [dau, top, count] = await Promise.all([
           api.activeUsers({ time_window: '30d', interval: 'day' }),
           api.topEvents({ time_window: '7d', limit: '10' }),
+          api.eventCount({ time_window: '7d', interval: 'week' }),
         ]);
         setDauData(
           (dau?.data || []).map((d) => ({
@@ -26,7 +28,7 @@ export default function DashboardPage() {
             users: d.count,
           }))
         );
-        setTopEvents(dau?.data || []);
+        setTotalEvents((count?.data || []).reduce((sum, d) => sum + d.count, 0));
         setTopEvents(
           (top?.data || []).map((d) => ({
             name: d.event_name,
@@ -42,8 +44,9 @@ export default function DashboardPage() {
     load();
   }, []);
 
-  const totalDAU = dauData.length > 0 ? dauData[dauData.length - 1]?.users : 0;
-  const totalEvents = topEvents.reduce((sum, e) => sum + e.count, 0);
+  const latestDAU = dauData.length > 0 ? dauData[dauData.length - 1].users : 0;
+  const previousDAU = dauData.length > 1 ? dauData[dauData.length - 2].users : 0;
+  const trend = previousDAU ? `${latestDAU >= previousDAU ? '+' : ''}${Math.round(((latestDAU - previousDAU) / previousDAU) * 100)}%` : '—';
 
   if (loading) return <LoadingSpinner />;
 
@@ -51,18 +54,13 @@ export default function DashboardPage() {
     <div>
       <PageHeader title="Dashboard" description="Overview of your analytics" />
 
-      {error && (
-        <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
-          {error}
-        </div>
-      )}
+      <ErrorMessage error={error} />
 
       {/* Stats */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <StatCard label="Daily Active Users" value={totalDAU.toLocaleString()} icon={Users} color="indigo" />
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+        <StatCard label="Daily Active Users" value={latestDAU.toLocaleString()} icon={Users} color="indigo" />
         <StatCard label="Events (7d)" value={totalEvents.toLocaleString()} icon={Zap} color="green" />
-        <StatCard label="Event Types" value={topEvents.length} icon={Activity} color="blue" />
-        <StatCard label="Trend" value={dauData.length > 1 ? '↗' : '—'} icon={TrendingUp} color="amber" />
+        <StatCard label="DAU vs Previous Day" value={trend} icon={TrendingUp} color="amber" />
       </div>
 
       {/* Charts */}

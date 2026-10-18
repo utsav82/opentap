@@ -1,20 +1,21 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api } from '../lib/api';
-import { Card, PageHeader, LoadingSpinner, EmptyState, Badge } from '../components/Card';
+import { Card, PageHeader, LoadingSpinner, EmptyState, Badge, ErrorMessage } from '../components/Card';
 
 function EventDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const [event, setEvent] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
-    api.getEvent(id).then(setEvent).catch(() => {}).finally(() => setLoading(false));
+    api.getEvent(id).then(setEvent).catch((err) => setError(err.message)).finally(() => setLoading(false));
   }, [id]);
 
   if (loading) return <LoadingSpinner />;
-  if (!event) return <EmptyState message="Event not found" />;
+  if (!event) return <ErrorMessage error={error} />;
 
   return (
     <div>
@@ -53,35 +54,39 @@ function EventList() {
   const [filters, setFilters] = useState({ event_name: '', user_id: '' });
   const [cursor, setCursor] = useState('');
   const [hasMore, setHasMore] = useState(false);
+  const [error, setError] = useState(null);
+  const [query, setQuery] = useState({ limit: '50' });
 
-  const fetchEvents = async (params = {}) => {
+  useEffect(() => {
+    api.listEvents(query)
+      .then((res) => {
+        setEvents((prev) => (query.cursor ? [...prev, ...(res.data || [])] : res.data || []));
+        setCursor(res.next_cursor || '');
+        setHasMore(res.has_more || false);
+      })
+      .catch((err) => setError(err.message))
+      .finally(() => setLoading(false));
+  }, [query]);
+
+  const load = (next) => {
     setLoading(true);
-    try {
-      const query = { limit: '50', ...params };
-      if (filters.event_name) query.event_name = filters.event_name;
-      if (filters.user_id) query.user_id = filters.user_id;
-      const res = await api.listEvents(query);
-      setEvents(params.cursor ? (prev) => [...prev, ...(res.data || [])] : res.data || []);
-      setCursor(res.next_cursor || '');
-      setHasMore(res.has_more || false);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
-    }
+    setError(null);
+    setQuery(next);
   };
-
-  useEffect(() => { fetchEvents(); }, []);
 
   const handleFilter = (e) => {
     e.preventDefault();
     setEvents([]);
-    fetchEvents();
+    const next = { limit: '50' };
+    if (filters.event_name) next.event_name = filters.event_name;
+    if (filters.user_id) next.user_id = filters.user_id;
+    load(next);
   };
 
   return (
     <div>
       <PageHeader title="Events" description="All tracked events" />
+      <ErrorMessage error={error} />
 
       {/* Filters */}
       <Card className="p-4 mb-6">
@@ -151,12 +156,12 @@ function EventList() {
         </div>
 
         {loading && <LoadingSpinner />}
-        {!loading && events.length === 0 && <EmptyState message="No events found" />}
+        {!loading && !error && events.length === 0 && <EmptyState message="No events found" />}
 
         {hasMore && !loading && (
           <div className="p-4 text-center border-t border-gray-100">
             <button
-              onClick={() => fetchEvents({ cursor })}
+              onClick={() => load({ ...query, cursor })}
               className="text-sm text-indigo-600 hover:underline font-medium"
             >
               Load more

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,7 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/google/uuid"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -20,11 +19,11 @@ import (
 	"github.com/opentap/opentap/internal/config"
 	"github.com/opentap/opentap/internal/events"
 	"github.com/opentap/opentap/internal/middleware"
-	"github.com/opentap/opentap/internal/models"
 	"github.com/opentap/opentap/internal/projects"
 	"github.com/opentap/opentap/internal/schemas"
 	"github.com/opentap/opentap/internal/segments"
 	"github.com/opentap/opentap/internal/users"
+	"github.com/opentap/opentap/migrations"
 	"github.com/opentap/opentap/pkg/cache"
 	"github.com/opentap/opentap/pkg/db"
 	"github.com/opentap/opentap/pkg/queue"
@@ -41,6 +40,9 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load config")
 	}
+	if cfg.AdminToken == "" {
+		log.Fatal().Msg("ADMIN_TOKEN is required")
+	}
 
 	ctx := context.Background()
 
@@ -51,6 +53,10 @@ func main() {
 	}
 	defer pool.Close()
 	log.Info().Msg("connected to PostgreSQL")
+
+	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
+		log.Fatal().Err(err).Msg("failed to run migrations")
+	}
 
 	// Connect Redis
 	redisClient, err := cache.NewRedisClient(cfg.RedisURL)
@@ -79,11 +85,11 @@ func main() {
 
 	// Init services
 	eventSvc := events.NewService(eventRepo, natsClient)
-	userSvc := users.NewService(userRepo, redisClient)
+	userSvc := users.NewService(userRepo)
 	segmentSvc := segments.NewService(segmentRepo, redisClient)
 	schemaSvc := schemas.NewService(schemaRepo)
 	analyticsSvc := analytics.NewService(analyticsRepo)
-	projectSvc := projects.NewService(projectRepo)
+	projectSvc := projects.NewService(projectRepo, authRepo)
 
 	// Init handlers
 	eventHandler := events.NewHandler(eventSvc)
@@ -105,66 +111,23 @@ func main() {
 	// Global middleware
 	r.Use(middleware.Recovery)
 	r.Use(middleware.RequestLogging)
+	r.Use(middleware.CORS)
+	r.Use(chimiddleware.RequestSize(5 << 20))
 
 	// Health check (no auth)
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		response.JSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
-	// Admin routes (no API key auth for project creation — bootstrap)
+	// Admin routes
 	r.Route("/v1/projects", func(r chi.Router) {
+		r.Use(auth.AdminOnly(cfg.AdminToken))
 		r.Post("/", projectHandler.CreateProject)
 		r.Get("/", projectHandler.ListProjects)
 		r.Get("/{id}", projectHandler.GetProject)
-
-		// API key management
-		r.Post("/{id}/keys", func(w http.ResponseWriter, r *http.Request) {
-			projectID, err := uuid.Parse(chi.URLParam(r, "id"))
-			if err != nil {
-				response.Error(w, http.StatusBadRequest, "bad_request", "Invalid project ID")
-				return
-			}
-
-			var req models.CreateAPIKeyRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				response.Error(w, http.StatusBadRequest, "bad_request", "Invalid JSON body")
-				return
-			}
-
-			rawKey, apiKey, err := authRepo.CreateKey(r.Context(), projectID, req.Label)
-			if err != nil {
-				response.Error(w, http.StatusInternalServerError, "internal_error", "Failed to create API key")
-				return
-			}
-
-			response.JSON(w, http.StatusCreated, map[string]interface{}{
-				"id":         apiKey.ID,
-				"key":        rawKey,
-				"key_prefix": apiKey.KeyPrefix,
-				"label":      apiKey.Label,
-				"created_at": apiKey.CreatedAt,
-			})
-		})
-
-		r.Delete("/{id}/keys/{key_id}", func(w http.ResponseWriter, r *http.Request) {
-			projectID, err := uuid.Parse(chi.URLParam(r, "id"))
-			if err != nil {
-				response.Error(w, http.StatusBadRequest, "bad_request", "Invalid project ID")
-				return
-			}
-			keyID, err := uuid.Parse(chi.URLParam(r, "key_id"))
-			if err != nil {
-				response.Error(w, http.StatusBadRequest, "bad_request", "Invalid key ID")
-				return
-			}
-
-			if err := authRepo.RevokeKey(r.Context(), projectID, keyID); err != nil {
-				response.Error(w, http.StatusNotFound, "not_found", "API key not found or already revoked")
-				return
-			}
-
-			w.WriteHeader(http.StatusNoContent)
-		})
+		r.Post("/{id}/keys", projectHandler.CreateKey)
+		r.Get("/{id}/keys", projectHandler.ListKeys)
+		r.Delete("/{id}/keys/{key_id}", projectHandler.RevokeKey)
 	})
 
 	// Authenticated API routes
@@ -172,33 +135,43 @@ func main() {
 		r.Use(authMiddleware.Authenticate)
 		r.Use(rateLimiter.Limit)
 
-		// Events
+		// Ingestion (any key, including ingest-only keys used by client SDKs)
 		r.Post("/v1/events", eventHandler.TrackEvent)
 		r.Post("/v1/events/batch", eventHandler.TrackBatch)
-		r.Get("/v1/events", eventHandler.ListEvents)
-		r.Get("/v1/events/{id}", eventHandler.GetEvent)
+		r.Post("/v1/identify", userHandler.Identify)
 
-		// Users
-		r.Get("/v1/users", userHandler.ListUsers)
-		r.Get("/v1/users/{id}", userHandler.GetUser)
-		r.Get("/v1/users/{id}/events", userHandler.GetUserEvents)
+		r.Group(func(r chi.Router) {
+			r.Use(auth.FullAccess)
 
-		// Segments
-		r.Post("/v1/segments", segmentHandler.CreateSegment)
-		r.Get("/v1/segments", segmentHandler.ListSegments)
-		r.Get("/v1/segments/{id}", segmentHandler.GetSegment)
-		r.Put("/v1/segments/{id}", segmentHandler.UpdateSegment)
-		r.Delete("/v1/segments/{id}", segmentHandler.DeleteSegment)
-		r.Get("/v1/segments/{id}/users", segmentHandler.GetSegmentUsers)
+			// Events
+			r.Get("/v1/events", eventHandler.ListEvents)
+			r.Get("/v1/events/{id}", eventHandler.GetEvent)
 
-		// Schemas
-		r.Get("/v1/schemas", schemaHandler.ListSchemas)
-		r.Get("/v1/schemas/{event_name}", schemaHandler.GetSchema)
+			// Users
+			r.Get("/v1/users", userHandler.ListUsers)
+			r.Get("/v1/users/{id}", userHandler.GetUser)
+			r.Get("/v1/users/{id}/events", userHandler.GetUserEvents)
 
-		// Analytics
-		r.Get("/v1/analytics/events/count", analyticsHandler.EventCountOverTime)
-		r.Get("/v1/analytics/events/top", analyticsHandler.TopEvents)
-		r.Get("/v1/analytics/users/active", analyticsHandler.DAU)
+			// Segments
+			r.Post("/v1/segments", segmentHandler.CreateSegment)
+			r.Get("/v1/segments", segmentHandler.ListSegments)
+			r.Get("/v1/segments/{id}", segmentHandler.GetSegment)
+			r.Put("/v1/segments/{id}", segmentHandler.UpdateSegment)
+			r.Delete("/v1/segments/{id}", segmentHandler.DeleteSegment)
+			r.Get("/v1/segments/{id}/users", segmentHandler.GetSegmentUsers)
+			r.Get("/v1/segments/{id}/export", segmentHandler.ExportSegmentUsers)
+
+			// Schemas
+			r.Get("/v1/schemas", schemaHandler.ListSchemas)
+			r.Get("/v1/schemas/{event_name}", schemaHandler.GetSchema)
+
+			// Analytics
+			r.Get("/v1/analytics/events/count", analyticsHandler.EventCountOverTime)
+			r.Get("/v1/analytics/events/top", analyticsHandler.TopEvents)
+			r.Get("/v1/analytics/users/active", analyticsHandler.DAU)
+			r.Get("/v1/analytics/funnel", analyticsHandler.Funnel)
+			r.Get("/v1/analytics/retention", analyticsHandler.Retention)
+		})
 	})
 
 	// Start server

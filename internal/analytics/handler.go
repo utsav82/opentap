@@ -3,8 +3,9 @@ package analytics
 import (
 	"net/http"
 	"strconv"
+	"strings"
 
-	"github.com/google/uuid"
+	"github.com/opentap/opentap/internal/auth"
 	"github.com/opentap/opentap/internal/models"
 	"github.com/opentap/opentap/pkg/response"
 )
@@ -18,8 +19,6 @@ func NewHandler(service Service) *Handler {
 }
 
 func (h *Handler) EventCountOverTime(w http.ResponseWriter, r *http.Request) {
-	projectID := r.Context().Value("project_id").(uuid.UUID)
-
 	query := models.AnalyticsQuery{
 		EventName:  r.URL.Query().Get("event_name"),
 		TimeWindow: r.URL.Query().Get("time_window"),
@@ -33,14 +32,10 @@ func (h *Handler) EventCountOverTime(w http.ResponseWriter, r *http.Request) {
 		query.Interval = "day"
 	}
 
-	points, err := h.service.EventCountOverTime(r.Context(), projectID, query)
+	points, err := h.service.EventCountOverTime(r.Context(), auth.ProjectID(r.Context()), query)
 	if err != nil {
-		response.Error(w, http.StatusInternalServerError, "internal_error", "Failed to query analytics")
+		response.Fail(w, err)
 		return
-	}
-
-	if points == nil {
-		points = []TimeSeriesPoint{}
 	}
 
 	response.JSON(w, http.StatusOK, map[string]interface{}{
@@ -49,8 +44,6 @@ func (h *Handler) EventCountOverTime(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) TopEvents(w http.ResponseWriter, r *http.Request) {
-	projectID := r.Context().Value("project_id").(uuid.UUID)
-
 	timeWindow := r.URL.Query().Get("time_window")
 	if timeWindow == "" {
 		timeWindow = "7d"
@@ -63,14 +56,10 @@ func (h *Handler) TopEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	counts, err := h.service.TopEvents(r.Context(), projectID, timeWindow, limit)
+	counts, err := h.service.TopEvents(r.Context(), auth.ProjectID(r.Context()), timeWindow, limit)
 	if err != nil {
-		response.Error(w, http.StatusInternalServerError, "internal_error", "Failed to query analytics")
+		response.Fail(w, err)
 		return
-	}
-
-	if counts == nil {
-		counts = []EventCount{}
 	}
 
 	response.JSON(w, http.StatusOK, map[string]interface{}{
@@ -79,8 +68,6 @@ func (h *Handler) TopEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) DAU(w http.ResponseWriter, r *http.Request) {
-	projectID := r.Context().Value("project_id").(uuid.UUID)
-
 	query := models.AnalyticsQuery{
 		TimeWindow: r.URL.Query().Get("time_window"),
 		Interval:   r.URL.Query().Get("interval"),
@@ -93,17 +80,55 @@ func (h *Handler) DAU(w http.ResponseWriter, r *http.Request) {
 		query.Interval = "day"
 	}
 
-	points, err := h.service.DAU(r.Context(), projectID, query)
+	points, err := h.service.DAU(r.Context(), auth.ProjectID(r.Context()), query)
 	if err != nil {
-		response.Error(w, http.StatusInternalServerError, "internal_error", "Failed to query analytics")
+		response.Fail(w, err)
 		return
-	}
-
-	if points == nil {
-		points = []TimeSeriesPoint{}
 	}
 
 	response.JSON(w, http.StatusOK, map[string]interface{}{
 		"data": points,
+	})
+}
+
+func (h *Handler) Funnel(w http.ResponseWriter, r *http.Request) {
+	steps := strings.Split(r.URL.Query().Get("steps"), ",")
+	for i := range steps {
+		steps[i] = strings.TrimSpace(steps[i])
+	}
+
+	result, err := h.service.Funnel(r.Context(), auth.ProjectID(r.Context()), steps, r.URL.Query().Get("time_window"))
+	if err != nil {
+		response.Fail(w, err)
+		return
+	}
+
+	response.JSON(w, http.StatusOK, map[string]interface{}{
+		"data": result,
+	})
+}
+
+func (h *Handler) Retention(w http.ResponseWriter, r *http.Request) {
+	query := RetentionQuery{
+		StartEvent:  r.URL.Query().Get("start_event"),
+		ReturnEvent: r.URL.Query().Get("return_event"),
+		Interval:    r.URL.Query().Get("interval"),
+		Periods:     8,
+	}
+	if query.Interval == "" {
+		query.Interval = "week"
+	}
+	if p := r.URL.Query().Get("periods"); p != "" {
+		query.Periods, _ = strconv.Atoi(p)
+	}
+
+	cohorts, err := h.service.Retention(r.Context(), auth.ProjectID(r.Context()), query)
+	if err != nil {
+		response.Fail(w, err)
+		return
+	}
+
+	response.JSON(w, http.StatusOK, map[string]interface{}{
+		"data": cohorts,
 	})
 }

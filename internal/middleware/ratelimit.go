@@ -1,14 +1,16 @@
 package middleware
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/opentap/opentap/internal/auth"
 	"github.com/opentap/opentap/pkg/cache"
 	"github.com/opentap/opentap/pkg/response"
+	"github.com/redis/go-redis/v9"
 )
 
 type RateLimiter struct {
@@ -25,49 +27,38 @@ func NewRateLimiter(redis *cache.RedisClient, limit int, window time.Duration) *
 	}
 }
 
+// Limit uses a sliding window approximated from the current and previous fixed windows.
 func (rl *RateLimiter) Limit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Get project_id from context (set by auth middleware)
-		projectID, ok := r.Context().Value("project_id").(uuid.UUID)
-		if !ok {
-			// No project_id = no rate limiting (e.g., health check)
-			next.ServeHTTP(w, r)
-			return
+		now := time.Now()
+		current := now.Truncate(rl.window)
+		key := func(t time.Time) string {
+			return fmt.Sprintf("ratelimit:%s:%d", auth.ProjectID(r.Context()), t.Unix())
 		}
 
-		windowKey := time.Now().Truncate(rl.window).Unix()
-		key := fmt.Sprintf("ratelimit:%s:%d", projectID.String(), windowKey)
-
-		count, err := rl.redis.Incr(r.Context(), key)
-		if err != nil {
+		pipe := rl.redis.Client.TxPipeline()
+		incr := pipe.Incr(r.Context(), key(current))
+		pipe.Expire(r.Context(), key(current), 2*rl.window)
+		prev := pipe.Get(r.Context(), key(current.Add(-rl.window)))
+		if _, err := pipe.Exec(r.Context()); err != nil && !errors.Is(err, redis.Nil) {
 			// If Redis is down, allow the request
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Set TTL on first request in window
-		if count == 1 {
-			rl.redis.Expire(r.Context(), key, rl.window)
-		}
+		previous, _ := prev.Int64()
+		weight := 1 - float64(now.Sub(current))/float64(rl.window)
+		count := int(float64(previous)*weight) + int(incr.Val())
 
-		// Set rate limit headers
 		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rl.limit))
-		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(max(0, rl.limit-int(count))))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(max(0, rl.limit-count)))
 
-		if int(count) > rl.limit {
-			retryAfter := rl.window.Seconds()
-			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter)))
+		if count > rl.limit {
+			w.Header().Set("Retry-After", strconv.Itoa(int(rl.window.Seconds())))
 			response.Error(w, http.StatusTooManyRequests, "rate_limited", "Rate limit exceeded")
 			return
 		}
 
 		next.ServeHTTP(w, r)
 	})
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }

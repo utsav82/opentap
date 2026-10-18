@@ -43,21 +43,8 @@ func (r *postgresRepository) GetByID(ctx context.Context, id uuid.UUID) (*models
 }
 
 func (r *postgresRepository) List(ctx context.Context) ([]*models.Project, error) {
-	rows, err := r.pool.Query(ctx,
+	rows, _ := r.pool.Query(ctx,
 		`SELECT id, name, created_at, updated_at FROM projects ORDER BY created_at DESC`,
 	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var projects []*models.Project
-	for rows.Next() {
-		p := &models.Project{}
-		if err := rows.Scan(&p.ID, &p.Name, &p.CreatedAt, &p.UpdatedAt); err != nil {
-			return nil, err
-		}
-		projects = append(projects, p)
-	}
-	return projects, nil
+	return pgx.CollectRows(rows, pgx.RowToAddrOfStructByPos[models.Project])
 }

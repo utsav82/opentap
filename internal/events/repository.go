@@ -2,7 +2,6 @@ package events
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"strings"
 	"time"
@@ -11,26 +10,16 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/opentap/opentap/internal/models"
+	"github.com/opentap/opentap/internal/pagination"
 )
 
-type TimeSeriesPoint struct {
-	Timestamp time.Time `json:"timestamp"`
-	Count     int64     `json:"count"`
-}
-
-type EventCount struct {
-	EventName string `json:"event_name"`
-	Count     int64  `json:"count"`
-}
+const eventColumns = `id, project_id, user_id, event_name, properties, timestamp, received_at`
 
 type Repository interface {
-	Insert(ctx context.Context, event *models.Event) error
-	InsertBatch(ctx context.Context, events []*models.Event) error
+	Ingest(ctx context.Context, event *models.Event) error
 	GetByID(ctx context.Context, projectID, eventID uuid.UUID) (*models.Event, error)
 	List(ctx context.Context, projectID uuid.UUID, params models.CursorParams, filters EventFilters) ([]*models.Event, string, error)
-	ListByUser(ctx context.Context, projectID uuid.UUID, userID string, params models.CursorParams, filters EventFilters) ([]*models.Event, string, error)
-	CountByName(ctx context.Context, projectID uuid.UUID, query models.AnalyticsQuery) ([]TimeSeriesPoint, error)
-	TopEvents(ctx context.Context, projectID uuid.UUID, timeWindow string, limit int) ([]EventCount, error)
+	SetRetention(ctx context.Context, days int) error
 }
 
 type EventFilters struct {
@@ -48,41 +37,47 @@ func NewRepository(pool *pgxpool.Pool) Repository {
 	return &postgresRepository{pool: pool}
 }
 
-func (r *postgresRepository) Insert(ctx context.Context, event *models.Event) error {
-	_, err := r.pool.Exec(ctx,
-		`INSERT INTO events (id, project_id, user_id, event_name, properties, timestamp, received_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		event.ID, event.ProjectID, event.UserID, event.EventName, event.Properties, event.Timestamp, event.ReceivedAt,
-	)
-	return err
-}
-
-func (r *postgresRepository) InsertBatch(ctx context.Context, events []*models.Event) error {
-	batch := &pgx.Batch{}
-	for _, event := range events {
-		batch.Queue(
-			`INSERT INTO events (id, project_id, user_id, event_name, properties, timestamp, received_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			event.ID, event.ProjectID, event.UserID, event.EventName, event.Properties, event.Timestamp, event.ReceivedAt,
-		)
-	}
-	br := r.pool.SendBatch(ctx, batch)
-	defer br.Close()
-	for range events {
-		if _, err := br.Exec(); err != nil {
+// Ingest stores the event and updates its user atomically. Redelivered events are ignored,
+// and events sent under an identified anonymous ID are attributed to the known user.
+func (r *postgresRepository) Ingest(ctx context.Context, event *models.Event) error {
+	return pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2, 0))`, event.ProjectID, event.UserID); err != nil {
 			return err
 		}
-	}
-	return nil
+		err := tx.QueryRow(ctx, `SELECT user_id FROM user_aliases WHERE project_id = $1 AND alias = $2`, event.ProjectID, event.UserID).Scan(&event.UserID)
+		if err != nil && err != pgx.ErrNoRows {
+			return err
+		}
+
+		ct, err := tx.Exec(ctx,
+			`INSERT INTO events (`+eventColumns+`) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING`,
+			event.ID, event.ProjectID, event.UserID, event.EventName, event.Properties, event.Timestamp, event.ReceivedAt,
+		)
+		if err != nil || ct.RowsAffected() == 0 {
+			return err
+		}
+		userProperties := event.UserProperties
+		if userProperties == nil {
+			userProperties = map[string]interface{}{}
+		}
+		_, err = tx.Exec(ctx,
+			`INSERT INTO users (project_id, user_id, properties, first_seen, last_seen, event_count)
+			 VALUES ($1, $2, $4, $3, $3, 1)
+			 ON CONFLICT (project_id, user_id) DO UPDATE SET
+			   properties = users.properties || EXCLUDED.properties,
+			   first_seen = LEAST(users.first_seen, EXCLUDED.first_seen),
+			   last_seen = GREATEST(users.last_seen, EXCLUDED.last_seen),
+			   event_count = users.event_count + 1,
+			   updated_at = NOW()`,
+			event.ProjectID, event.UserID, event.Timestamp, userProperties,
+		)
+		return err
+	})
 }
 
 func (r *postgresRepository) GetByID(ctx context.Context, projectID, eventID uuid.UUID) (*models.Event, error) {
-	event := &models.Event{}
-	err := r.pool.QueryRow(ctx,
-		`SELECT id, project_id, user_id, event_name, properties, timestamp, received_at
-		 FROM events WHERE id = $1 AND project_id = $2`,
-		eventID, projectID,
-	).Scan(&event.ID, &event.ProjectID, &event.UserID, &event.EventName, &event.Properties, &event.Timestamp, &event.ReceivedAt)
+	rows, _ := r.pool.Query(ctx, `SELECT `+eventColumns+` FROM events WHERE id = $1 AND project_id = $2`, eventID, projectID)
+	event, err := pgx.CollectOneRow(rows, pgx.RowToAddrOfStructByPos[models.Event])
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -92,205 +87,49 @@ func (r *postgresRepository) GetByID(ctx context.Context, projectID, eventID uui
 func (r *postgresRepository) List(ctx context.Context, projectID uuid.UUID, params models.CursorParams, filters EventFilters) ([]*models.Event, string, error) {
 	args := []interface{}{projectID}
 	conditions := []string{"project_id = $1"}
-	argIdx := 2
+	where := func(clause string, values ...interface{}) {
+		for _, v := range values {
+			args = append(args, v)
+			clause = strings.Replace(clause, "?", fmt.Sprintf("$%d", len(args)), 1)
+		}
+		conditions = append(conditions, clause)
+	}
 
 	if filters.EventName != "" {
-		conditions = append(conditions, fmt.Sprintf("event_name = $%d", argIdx))
-		args = append(args, filters.EventName)
-		argIdx++
+		where("event_name = ?", filters.EventName)
 	}
 	if filters.UserID != "" {
-		conditions = append(conditions, fmt.Sprintf("user_id = $%d", argIdx))
-		args = append(args, filters.UserID)
-		argIdx++
+		where("user_id = ?", filters.UserID)
 	}
 	if filters.Start != nil {
-		conditions = append(conditions, fmt.Sprintf("timestamp >= $%d", argIdx))
-		args = append(args, *filters.Start)
-		argIdx++
+		where("timestamp >= ?", *filters.Start)
 	}
 	if filters.End != nil {
-		conditions = append(conditions, fmt.Sprintf("timestamp <= $%d", argIdx))
-		args = append(args, *filters.End)
-		argIdx++
+		where("timestamp <= ?", *filters.End)
+	}
+	if ts, id, ok := pagination.Decode(params.Cursor); ok {
+		where("(timestamp, id) < (?, ?)", ts, id)
 	}
 
-	if params.Cursor != "" {
-		ts, id, err := decodeCursor(params.Cursor)
-		if err == nil {
-			conditions = append(conditions, fmt.Sprintf("(timestamp, id) < ($%d, $%d)", argIdx, argIdx+1))
-			args = append(args, ts, id)
-			argIdx += 2
-		}
-	}
-
-	limit := params.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 50
-	}
-
-	query := fmt.Sprintf(
-		`SELECT id, project_id, user_id, event_name, properties, timestamp, received_at
-		 FROM events WHERE %s ORDER BY timestamp DESC, id DESC LIMIT $%d`,
-		strings.Join(conditions, " AND "), argIdx,
+	rows, _ := r.pool.Query(ctx,
+		fmt.Sprintf(`SELECT `+eventColumns+` FROM events WHERE %s ORDER BY timestamp DESC, id DESC LIMIT $%d`,
+			strings.Join(conditions, " AND "), len(args)+1),
+		append(args, params.Limit+1)...,
 	)
-	args = append(args, limit+1)
-
-	rows, err := r.pool.Query(ctx, query, args...)
+	events, err := pgx.CollectRows(rows, pgx.RowToAddrOfStructByPos[models.Event])
 	if err != nil {
 		return nil, "", err
 	}
-	defer rows.Close()
+	events, next := pagination.Page(events, params.Limit, func(e *models.Event) (time.Time, uuid.UUID) { return e.Timestamp, e.ID })
+	return events, next, nil
+}
 
-	var events []*models.Event
-	for rows.Next() {
-		e := &models.Event{}
-		if err := rows.Scan(&e.ID, &e.ProjectID, &e.UserID, &e.EventName, &e.Properties, &e.Timestamp, &e.ReceivedAt); err != nil {
-			return nil, "", err
+func (r *postgresRepository) SetRetention(ctx context.Context, days int) error {
+	return pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT remove_retention_policy('events', if_exists => TRUE)`); err != nil {
+			return err
 		}
-		events = append(events, e)
-	}
-
-	var nextCursor string
-	if len(events) > limit {
-		events = events[:limit]
-		last := events[limit-1]
-		nextCursor = encodeCursor(last.Timestamp, last.ID)
-	}
-
-	return events, nextCursor, nil
-}
-
-func (r *postgresRepository) ListByUser(ctx context.Context, projectID uuid.UUID, userID string, params models.CursorParams, filters EventFilters) ([]*models.Event, string, error) {
-	filters.UserID = userID
-	return r.List(ctx, projectID, params, filters)
-}
-
-func (r *postgresRepository) CountByName(ctx context.Context, projectID uuid.UUID, query models.AnalyticsQuery) ([]TimeSeriesPoint, error) {
-	interval := mapInterval(query.Interval)
-	timeFilter := mapTimeWindow(query.TimeWindow)
-
-	args := []interface{}{projectID}
-	conditions := "project_id = $1"
-	argIdx := 2
-
-	if timeFilter != "" {
-		conditions += fmt.Sprintf(" AND timestamp >= NOW() - INTERVAL '%s'", timeFilter)
-	}
-	if query.EventName != "" {
-		conditions += fmt.Sprintf(" AND event_name = $%d", argIdx)
-		args = append(args, query.EventName)
-	}
-
-	q := fmt.Sprintf(
-		`SELECT time_bucket('%s', timestamp) AS bucket, COUNT(*) AS count
-		 FROM events WHERE %s
-		 GROUP BY bucket ORDER BY bucket ASC`,
-		interval, conditions,
-	)
-
-	rows, err := r.pool.Query(ctx, q, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var points []TimeSeriesPoint
-	for rows.Next() {
-		var p TimeSeriesPoint
-		if err := rows.Scan(&p.Timestamp, &p.Count); err != nil {
-			return nil, err
-		}
-		points = append(points, p)
-	}
-	return points, nil
-}
-
-func (r *postgresRepository) TopEvents(ctx context.Context, projectID uuid.UUID, timeWindow string, limit int) ([]EventCount, error) {
-	timeFilter := mapTimeWindow(timeWindow)
-	conditions := "project_id = $1"
-	if timeFilter != "" {
-		conditions += fmt.Sprintf(" AND timestamp >= NOW() - INTERVAL '%s'", timeFilter)
-	}
-
-	q := fmt.Sprintf(
-		`SELECT event_name, COUNT(*) AS count FROM events
-		 WHERE %s GROUP BY event_name ORDER BY count DESC LIMIT $2`,
-		conditions,
-	)
-
-	rows, err := r.pool.Query(ctx, q, projectID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var counts []EventCount
-	for rows.Next() {
-		var ec EventCount
-		if err := rows.Scan(&ec.EventName, &ec.Count); err != nil {
-			return nil, err
-		}
-		counts = append(counts, ec)
-	}
-	return counts, nil
-}
-
-func encodeCursor(ts time.Time, id uuid.UUID) string {
-	raw := fmt.Sprintf("%s:%s", ts.Format(time.RFC3339Nano), id.String())
-	return base64.StdEncoding.EncodeToString([]byte(raw))
-}
-
-func decodeCursor(cursor string) (time.Time, uuid.UUID, error) {
-	raw, err := base64.StdEncoding.DecodeString(cursor)
-	if err != nil {
-		return time.Time{}, uuid.Nil, err
-	}
-	parts := strings.SplitN(string(raw), ":", 2)
-	if len(parts) != 2 {
-		return time.Time{}, uuid.Nil, fmt.Errorf("invalid cursor format")
-	}
-	ts, err := time.Parse(time.RFC3339Nano, parts[0])
-	if err != nil {
-		return time.Time{}, uuid.Nil, err
-	}
-	id, err := uuid.Parse(parts[1])
-	if err != nil {
-		return time.Time{}, uuid.Nil, err
-	}
-	return ts, id, nil
-}
-
-func mapInterval(interval string) string {
-	switch interval {
-	case "hour":
-		return "1 hour"
-	case "day":
-		return "1 day"
-	case "week":
-		return "1 week"
-	case "month":
-		return "1 month"
-	default:
-		return "1 day"
-	}
-}
-
-func mapTimeWindow(tw string) string {
-	switch tw {
-	case "1h":
-		return "1 hour"
-	case "24h":
-		return "24 hours"
-	case "7d":
-		return "7 days"
-	case "30d":
-		return "30 days"
-	case "90d":
-		return "90 days"
-	case "all":
-		return ""
-	default:
-		return "7 days"
-	}
+		_, err := tx.Exec(ctx, `SELECT add_retention_policy('events', make_interval(days => $1))`, days)
+		return err
+	})
 }

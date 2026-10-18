@@ -2,16 +2,17 @@ package segments
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/opentap/opentap/internal/models"
+	"github.com/opentap/opentap/internal/pagination"
 )
+
+const segmentColumns = `id, project_id, name, description, conditions, created_at, updated_at, last_computed_at, webhook_url`
 
 type Repository interface {
 	Create(ctx context.Context, segment *models.Segment) error
@@ -20,9 +21,17 @@ type Repository interface {
 	Update(ctx context.Context, segment *models.Segment) error
 	Delete(ctx context.Context, projectID, segmentID uuid.UUID) error
 	ListAll(ctx context.Context) ([]*models.Segment, error)
-	ReplaceUsers(ctx context.Context, segmentID uuid.UUID, userIDs []uuid.UUID) error
+	Recompute(ctx context.Context, segment *models.Segment) (*Change, error)
 	GetUsers(ctx context.Context, segmentID uuid.UUID, params models.CursorParams) ([]*models.User, string, error)
+	EachUser(ctx context.Context, projectID, segmentID uuid.UUID, fn func(*models.User) error) error
 	CountUsers(ctx context.Context, segmentID uuid.UUID) (int64, error)
+}
+
+// Change is the result of a recompute: the new size and which external user IDs entered or left.
+type Change struct {
+	UserCount int64
+	Added     []string
+	Removed   []string
 }
 
 type postgresRepository struct {
@@ -35,19 +44,15 @@ func NewRepository(pool *pgxpool.Pool) Repository {
 
 func (r *postgresRepository) Create(ctx context.Context, segment *models.Segment) error {
 	return r.pool.QueryRow(ctx,
-		`INSERT INTO segments (project_id, name, description, conditions, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, NOW(), NOW()) RETURNING id, created_at, updated_at`,
-		segment.ProjectID, segment.Name, segment.Description, segment.Conditions,
+		`INSERT INTO segments (project_id, name, description, conditions, webhook_url, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, NOW(), NOW()) RETURNING id, created_at, updated_at`,
+		segment.ProjectID, segment.Name, segment.Description, segment.Conditions, segment.WebhookURL,
 	).Scan(&segment.ID, &segment.CreatedAt, &segment.UpdatedAt)
 }
 
 func (r *postgresRepository) GetByID(ctx context.Context, projectID, segmentID uuid.UUID) (*models.Segment, error) {
-	seg := &models.Segment{}
-	err := r.pool.QueryRow(ctx,
-		`SELECT id, project_id, name, description, conditions, created_at, updated_at
-		 FROM segments WHERE id = $1 AND project_id = $2`,
-		segmentID, projectID,
-	).Scan(&seg.ID, &seg.ProjectID, &seg.Name, &seg.Description, &seg.Conditions, &seg.CreatedAt, &seg.UpdatedAt)
+	rows, _ := r.pool.Query(ctx, `SELECT `+segmentColumns+` FROM segments WHERE id = $1 AND project_id = $2`, segmentID, projectID)
+	seg, err := pgx.CollectOneRow(rows, pgx.RowToAddrOfStructByPos[models.Segment])
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -56,60 +61,30 @@ func (r *postgresRepository) GetByID(ctx context.Context, projectID, segmentID u
 
 func (r *postgresRepository) List(ctx context.Context, projectID uuid.UUID, params models.CursorParams) ([]*models.Segment, string, error) {
 	args := []interface{}{projectID}
-	conditions := []string{"project_id = $1"}
-	argIdx := 2
-
-	if params.Cursor != "" {
-		ts, id, err := decodeSegmentCursor(params.Cursor)
-		if err == nil {
-			conditions = append(conditions, fmt.Sprintf("(created_at, id) < ($%d, $%d)", argIdx, argIdx+1))
-			args = append(args, ts, id)
-			argIdx += 2
-		}
+	cursor := ""
+	if ts, id, ok := pagination.Decode(params.Cursor); ok {
+		args = append(args, ts, id)
+		cursor = "AND (created_at, id) < ($2, $3)"
 	}
 
-	limit := params.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 50
-	}
-
-	query := fmt.Sprintf(
-		`SELECT id, project_id, name, description, conditions, created_at, updated_at
-		 FROM segments WHERE %s ORDER BY created_at DESC, id DESC LIMIT $%d`,
-		strings.Join(conditions, " AND "), argIdx,
+	rows, _ := r.pool.Query(ctx,
+		fmt.Sprintf(`SELECT `+segmentColumns+` FROM segments WHERE project_id = $1 %s ORDER BY created_at DESC, id DESC LIMIT $%d`,
+			cursor, len(args)+1),
+		append(args, params.Limit+1)...,
 	)
-	args = append(args, limit+1)
-
-	rows, err := r.pool.Query(ctx, query, args...)
+	segments, err := pgx.CollectRows(rows, pgx.RowToAddrOfStructByPos[models.Segment])
 	if err != nil {
 		return nil, "", err
 	}
-	defer rows.Close()
-
-	var segments []*models.Segment
-	for rows.Next() {
-		s := &models.Segment{}
-		if err := rows.Scan(&s.ID, &s.ProjectID, &s.Name, &s.Description, &s.Conditions, &s.CreatedAt, &s.UpdatedAt); err != nil {
-			return nil, "", err
-		}
-		segments = append(segments, s)
-	}
-
-	var nextCursor string
-	if len(segments) > limit {
-		segments = segments[:limit]
-		last := segments[limit-1]
-		nextCursor = encodeSegmentCursor(last.CreatedAt, last.ID)
-	}
-
-	return segments, nextCursor, nil
+	segments, next := pagination.Page(segments, params.Limit, func(s *models.Segment) (time.Time, uuid.UUID) { return s.CreatedAt, s.ID })
+	return segments, next, nil
 }
 
 func (r *postgresRepository) Update(ctx context.Context, segment *models.Segment) error {
 	_, err := r.pool.Exec(ctx,
-		`UPDATE segments SET name = $1, description = $2, conditions = $3, updated_at = NOW()
-		 WHERE id = $4 AND project_id = $5`,
-		segment.Name, segment.Description, segment.Conditions, segment.ID, segment.ProjectID,
+		`UPDATE segments SET name = $1, description = $2, conditions = $3, webhook_url = $4, updated_at = NOW()
+		 WHERE id = $5 AND project_id = $6`,
+		segment.Name, segment.Description, segment.Conditions, segment.WebhookURL, segment.ID, segment.ProjectID,
 	)
 	return err
 }
@@ -123,114 +98,90 @@ func (r *postgresRepository) Delete(ctx context.Context, projectID, segmentID uu
 		return err
 	}
 	if ct.RowsAffected() == 0 {
-		return fmt.Errorf("segment not found")
+		return fmt.Errorf("segment %w", models.ErrNotFound)
 	}
 	return nil
 }
 
 func (r *postgresRepository) ListAll(ctx context.Context) ([]*models.Segment, error) {
-	rows, err := r.pool.Query(ctx,
-		`SELECT id, project_id, name, description, conditions, created_at, updated_at FROM segments`,
-	)
+	rows, _ := r.pool.Query(ctx, `SELECT `+segmentColumns+` FROM segments`)
+	return pgx.CollectRows(rows, pgx.RowToAddrOfStructByPos[models.Segment])
+}
+
+// Recompute syncs segment_users with the segment's conditions in one statement,
+// keeping entered_at for users who still match.
+func (r *postgresRepository) Recompute(ctx context.Context, segment *models.Segment) (*Change, error) {
+	query, args, err := BuildQuery(segment.ProjectID, segment.Conditions)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	seg := fmt.Sprintf("$%d", len(args)+1)
 
-	var segments []*models.Segment
-	for rows.Next() {
-		s := &models.Segment{}
-		if err := rows.Scan(&s.ID, &s.ProjectID, &s.Name, &s.Description, &s.Conditions, &s.CreatedAt, &s.UpdatedAt); err != nil {
-			return nil, err
-		}
-		segments = append(segments, s)
-	}
-	return segments, nil
-}
-
-func (r *postgresRepository) ReplaceUsers(ctx context.Context, segmentID uuid.UUID, userIDs []uuid.UUID) error {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
-
-	_, err = tx.Exec(ctx, `DELETE FROM segment_users WHERE segment_id = $1`, segmentID)
-	if err != nil {
-		return err
-	}
-
-	if len(userIDs) > 0 {
-		batch := &pgx.Batch{}
-		for _, uid := range userIDs {
-			batch.Queue(
-				`INSERT INTO segment_users (segment_id, user_id, entered_at) VALUES ($1, $2, NOW())`,
-				segmentID, uid,
-			)
-		}
-		br := tx.SendBatch(ctx, batch)
-		for range userIDs {
-			if _, err := br.Exec(); err != nil {
-				br.Close()
-				return err
-			}
-		}
-		br.Close()
-	}
-
-	return tx.Commit(ctx)
+	change := &Change{}
+	err = r.pool.QueryRow(ctx, fmt.Sprintf(`
+		WITH matched AS (%[1]s),
+		removed AS (
+			DELETE FROM segment_users WHERE segment_id = %[2]s AND user_id NOT IN (SELECT id FROM matched)
+			RETURNING user_id
+		),
+		added AS (
+			INSERT INTO segment_users (segment_id, user_id) SELECT %[2]s, id FROM matched ON CONFLICT DO NOTHING
+			RETURNING user_id
+		),
+		stamped AS (
+			UPDATE segments SET last_computed_at = NOW() WHERE id = %[2]s
+		)
+		SELECT (SELECT COUNT(*) FROM matched),
+		       ARRAY(SELECT u.user_id FROM added a JOIN users u ON u.id = a.user_id),
+		       ARRAY(SELECT u.user_id FROM removed r JOIN users u ON u.id = r.user_id)`, query, seg),
+		append(args, segment.ID)...,
+	).Scan(&change.UserCount, &change.Added, &change.Removed)
+	return change, err
 }
 
 func (r *postgresRepository) GetUsers(ctx context.Context, segmentID uuid.UUID, params models.CursorParams) ([]*models.User, string, error) {
 	args := []interface{}{segmentID}
-	conditions := []string{"su.segment_id = $1"}
-	argIdx := 2
-
-	if params.Cursor != "" {
-		ts, id, err := decodeSegmentCursor(params.Cursor)
-		if err == nil {
-			conditions = append(conditions, fmt.Sprintf("(u.last_seen, u.id) < ($%d, $%d)", argIdx, argIdx+1))
-			args = append(args, ts, id)
-			argIdx += 2
-		}
+	cursor := ""
+	if ts, id, ok := pagination.Decode(params.Cursor); ok {
+		args = append(args, ts, id)
+		cursor = "AND (u.last_seen, u.id) < ($2, $3)"
 	}
 
-	limit := params.Limit
-	if limit <= 0 || limit > 100 {
-		limit = 50
-	}
-
-	query := fmt.Sprintf(
-		`SELECT u.id, u.project_id, u.user_id, u.properties, u.first_seen, u.last_seen, u.event_count, u.created_at, u.updated_at
+	rows, _ := r.pool.Query(ctx,
+		fmt.Sprintf(`SELECT u.id, u.project_id, u.user_id, u.properties, u.first_seen, u.last_seen, u.event_count, u.created_at, u.updated_at
 		 FROM segment_users su JOIN users u ON su.user_id = u.id
-		 WHERE %s ORDER BY u.last_seen DESC, u.id DESC LIMIT $%d`,
-		strings.Join(conditions, " AND "), argIdx,
+		 WHERE su.segment_id = $1 %s ORDER BY u.last_seen DESC, u.id DESC LIMIT $%d`,
+			cursor, len(args)+1),
+		append(args, params.Limit+1)...,
 	)
-	args = append(args, limit+1)
-
-	rows, err := r.pool.Query(ctx, query, args...)
+	users, err := pgx.CollectRows(rows, pgx.RowToAddrOfStructByPos[models.User])
 	if err != nil {
 		return nil, "", err
 	}
+	users, next := pagination.Page(users, params.Limit, func(u *models.User) (time.Time, uuid.UUID) { return u.LastSeen, u.ID })
+	return users, next, nil
+}
+
+func (r *postgresRepository) EachUser(ctx context.Context, projectID, segmentID uuid.UUID, fn func(*models.User) error) error {
+	rows, _ := r.pool.Query(ctx,
+		`SELECT u.id, u.project_id, u.user_id, u.properties, u.first_seen, u.last_seen, u.event_count, u.created_at, u.updated_at
+		 FROM segment_users su
+		 JOIN segments s ON s.id = su.segment_id AND s.project_id = $2
+		 JOIN users u ON u.id = su.user_id
+		 WHERE su.segment_id = $1 ORDER BY u.user_id`,
+		segmentID, projectID,
+	)
 	defer rows.Close()
-
-	var users []*models.User
 	for rows.Next() {
-		u := &models.User{}
-		if err := rows.Scan(&u.ID, &u.ProjectID, &u.UserID, &u.Properties, &u.FirstSeen, &u.LastSeen, &u.EventCount, &u.CreatedAt, &u.UpdatedAt); err != nil {
-			return nil, "", err
+		user, err := pgx.RowToAddrOfStructByPos[models.User](rows)
+		if err != nil {
+			return err
 		}
-		users = append(users, u)
+		if err := fn(user); err != nil {
+			return err
+		}
 	}
-
-	var nextCursor string
-	if len(users) > limit {
-		users = users[:limit]
-		last := users[limit-1]
-		nextCursor = encodeSegmentCursor(last.LastSeen, last.ID)
-	}
-
-	return users, nextCursor, nil
+	return rows.Err()
 }
 
 func (r *postgresRepository) CountUsers(ctx context.Context, segmentID uuid.UUID) (int64, error) {
@@ -240,53 +191,4 @@ func (r *postgresRepository) CountUsers(ctx context.Context, segmentID uuid.UUID
 		segmentID,
 	).Scan(&count)
 	return count, err
-}
-
-// QueryExecutor provides raw query execution for the segment worker.
-type QueryExecutor interface {
-	ExecuteQuery(ctx context.Context, query string, args []interface{}) ([]uuid.UUID, error)
-}
-
-// ExecuteQuery runs a raw SQL query that returns user UUIDs.
-func (r *postgresRepository) ExecuteQuery(ctx context.Context, query string, args []interface{}) ([]uuid.UUID, error) {
-	rows, err := r.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var userIDs []uuid.UUID
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		userIDs = append(userIDs, id)
-	}
-	return userIDs, nil
-}
-
-func encodeSegmentCursor(ts time.Time, id uuid.UUID) string {
-	raw := fmt.Sprintf("%s:%s", ts.Format(time.RFC3339Nano), id.String())
-	return base64.StdEncoding.EncodeToString([]byte(raw))
-}
-
-func decodeSegmentCursor(cursor string) (time.Time, uuid.UUID, error) {
-	raw, err := base64.StdEncoding.DecodeString(cursor)
-	if err != nil {
-		return time.Time{}, uuid.Nil, err
-	}
-	parts := strings.SplitN(string(raw), ":", 2)
-	if len(parts) != 2 {
-		return time.Time{}, uuid.Nil, fmt.Errorf("invalid cursor format")
-	}
-	ts, err := time.Parse(time.RFC3339Nano, parts[0])
-	if err != nil {
-		return time.Time{}, uuid.Nil, err
-	}
-	id, err := uuid.Parse(parts[1])
-	if err != nil {
-		return time.Time{}, uuid.Nil, err
-	}
-	return ts, id, nil
 }

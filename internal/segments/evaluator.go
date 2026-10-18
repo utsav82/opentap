@@ -1,304 +1,159 @@
 package segments
 
 import (
+	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/opentap/opentap/internal/models"
 )
 
-// Evaluator builds SQL queries from segment conditions.
-type Evaluator struct{}
+var comparisons = map[string]string{"eq": "=", "neq": "!=", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
 
-func NewEvaluator() *Evaluator {
-	return &Evaluator{}
-}
-
-// BuildQuery generates a SQL query that returns user internal UUIDs matching the segment conditions.
-func (e *Evaluator) BuildQuery(projectID uuid.UUID, conditions map[string]interface{}) (string, []interface{}, error) {
+// BuildQuery validates conditions and returns SQL selecting the internal IDs of matching users.
+func BuildQuery(projectID uuid.UUID, conditions map[string]interface{}) (string, []interface{}, error) {
 	operator, _ := conditions["operator"].(string)
-	if operator == "" {
-		operator = "AND"
+	if operator != "AND" && operator != "OR" {
+		return "", nil, errors.New("conditions.operator must be AND or OR")
+	}
+	rules, _ := conditions["rules"].([]interface{})
+	if len(rules) == 0 {
+		return "", nil, errors.New("conditions.rules must be a non-empty array")
 	}
 
-	rules, ok := conditions["rules"].([]interface{})
-	if !ok || len(rules) == 0 {
-		return "", nil, fmt.Errorf("conditions must have rules array")
-	}
-
-	var clauses []string
-	var args []interface{}
-	argIdx := 2 // $1 is project_id
-
-	for _, rule := range rules {
-		ruleMap, ok := rule.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		ruleType, _ := ruleMap["type"].(string)
-		switch ruleType {
+	q := &query{}
+	project := q.arg(projectID)
+	clauses := make([]string, len(rules))
+	for i, r := range rules {
+		rule, _ := r.(map[string]interface{})
+		var err error
+		switch rule["type"] {
 		case "event":
-			clause, newArgs, newIdx, err := e.buildEventRule(ruleMap, argIdx)
-			if err != nil {
-				return "", nil, err
-			}
-			clauses = append(clauses, clause)
-			args = append(args, newArgs...)
-			argIdx = newIdx
-
+			clauses[i], err = q.eventRule(project, rule)
 		case "user_property":
-			clause, newArgs, newIdx, err := e.buildUserPropertyRule(ruleMap, argIdx)
-			if err != nil {
-				return "", nil, err
-			}
-			clauses = append(clauses, clause)
-			args = append(args, newArgs...)
-			argIdx = newIdx
-
+			clauses[i], err = q.propertyFilter("u.properties", rule)
 		default:
-			return "", nil, fmt.Errorf("unknown rule type: %s", ruleType)
+			err = errors.New("type must be event or user_property")
+		}
+		if err != nil {
+			return "", nil, fmt.Errorf("rule %d: %w", i, err)
 		}
 	}
 
-	if len(clauses) == 0 {
-		return "", nil, fmt.Errorf("no valid rules found")
-	}
-
-	sqlOperator := " AND "
-	if operator == "OR" {
-		sqlOperator = " OR "
-	}
-
-	// Build the final query that returns user UUIDs
-	query := fmt.Sprintf(
-		`SELECT u.id FROM users u WHERE u.project_id = $1 AND (%s)`,
-		strings.Join(clauses, sqlOperator),
-	)
-
-	allArgs := []interface{}{projectID}
-	allArgs = append(allArgs, args...)
-
-	return query, allArgs, nil
+	sql := fmt.Sprintf("SELECT u.id FROM users u WHERE u.project_id = %s AND (%s)", project, strings.Join(clauses, " "+operator+" "))
+	return sql, q.args, nil
 }
 
-func (e *Evaluator) buildEventRule(rule map[string]interface{}, argIdx int) (string, []interface{}, int, error) {
-	eventName, _ := rule["event_name"].(string)
-	if eventName == "" {
-		return "", nil, argIdx, fmt.Errorf("event rule requires event_name")
-	}
-
-	timeWindow, _ := rule["time_window"].(string)
-	countOperator, _ := rule["count_operator"].(string)
-	countValue := getFloat64(rule, "count_value")
-
-	var args []interface{}
-
-	// Build subquery for counting events
-	subConditions := []string{fmt.Sprintf("e.event_name = $%d", argIdx)}
-	args = append(args, eventName)
-	argIdx++
-
-	subConditions = append(subConditions, "e.project_id = u.project_id")
-	subConditions = append(subConditions, "e.user_id = u.user_id")
-
-	// Time window filter
-	if timeWindow != "" && timeWindow != "all" {
-		interval := mapTimeWindowToInterval(timeWindow)
-		if interval != "" {
-			subConditions = append(subConditions, fmt.Sprintf("e.timestamp >= NOW() - INTERVAL '%s'", interval))
-		}
-	}
-
-	// Property filters
-	if propFilters, ok := rule["property_filters"].([]interface{}); ok {
-		for _, pf := range propFilters {
-			pfMap, ok := pf.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			prop, _ := pfMap["property"].(string)
-			op, _ := pfMap["operator"].(string)
-			val := pfMap["value"]
-
-			filterClause, filterArgs, newIdx := buildPropertyFilter(prop, op, val, argIdx)
-			if filterClause != "" {
-				subConditions = append(subConditions, filterClause)
-				args = append(args, filterArgs...)
-				argIdx = newIdx
-			}
-		}
-	}
-
-	// Build count comparison
-	sqlOp := mapComparisonOperator(countOperator)
-	subquery := fmt.Sprintf(
-		"(SELECT COUNT(*) FROM events e WHERE %s) %s $%d",
-		strings.Join(subConditions, " AND "),
-		sqlOp,
-		argIdx,
-	)
-	args = append(args, int64(countValue))
-	argIdx++
-
-	return subquery, args, argIdx, nil
+type query struct {
+	args []interface{}
 }
 
-func (e *Evaluator) buildUserPropertyRule(rule map[string]interface{}, argIdx int) (string, []interface{}, int, error) {
-	prop, _ := rule["property"].(string)
+func (q *query) arg(v interface{}) string {
+	q.args = append(q.args, v)
+	return fmt.Sprintf("$%d", len(q.args))
+}
+
+func (q *query) eventRule(project string, rule map[string]interface{}) (string, error) {
+	name, _ := rule["event_name"].(string)
+	if name == "" {
+		return "", errors.New("event_name is required")
+	}
+	where := []string{"e.project_id = " + project, "e.event_name = " + q.arg(name)}
+
+	if window, _ := rule["time_window"].(string); window != "" && window != "all" {
+		interval, ok := models.TimeWindows[window]
+		if !ok {
+			return "", fmt.Errorf("invalid time_window %q", window)
+		}
+		where = append(where, fmt.Sprintf("e.timestamp >= NOW() - INTERVAL '%s'", interval))
+	}
+
+	filters, _ := rule["property_filters"].([]interface{})
+	for _, f := range filters {
+		filter, _ := f.(map[string]interface{})
+		clause, err := q.propertyFilter("e.properties", filter)
+		if err != nil {
+			return "", err
+		}
+		where = append(where, clause)
+	}
+
+	op, _ := rule["count_operator"].(string)
+	if op == "" {
+		op = "gte"
+	}
+	if _, ok := comparisons[op]; !ok {
+		return "", fmt.Errorf("invalid count_operator %q", op)
+	}
+	count := 1.0
+	if rule["count_value"] != nil {
+		var err error
+		if count, err = toNumber(rule["count_value"]); err != nil || count < 0 || count != math.Trunc(count) {
+			return "", errors.New("count_value must be a non-negative integer")
+		}
+	}
+
+	n := int64(count)
+	having := fmt.Sprintf("COUNT(*) %s %s", comparisons[op], q.arg(n))
+	matched := fmt.Sprintf("SELECT e.user_id FROM events e WHERE %s GROUP BY e.user_id", strings.Join(where, " AND "))
+
+	// Users without any matching event have a count of 0, which the HAVING clause never sees.
+	zeroMatches := map[string]bool{"eq": n == 0, "neq": n != 0, "gt": false, "gte": n == 0, "lt": n > 0, "lte": true}[op]
+	if zeroMatches {
+		return fmt.Sprintf("u.user_id NOT IN (%s HAVING NOT (%s))", matched, having), nil
+	}
+	return fmt.Sprintf("u.user_id IN (%s HAVING %s)", matched, having), nil
+}
+
+func (q *query) propertyFilter(column string, filter map[string]interface{}) (string, error) {
+	prop, _ := filter["property"].(string)
 	if prop == "" {
-		return "", nil, argIdx, fmt.Errorf("user_property rule requires property")
+		return "", errors.New("property is required")
+	}
+	op, _ := filter["operator"].(string)
+	value := filter["value"]
+	if value == nil && op != "is_set" && op != "is_not_set" {
+		return "", fmt.Errorf("property %q: value is required", prop)
 	}
 
-	op, _ := rule["operator"].(string)
-	val := rule["value"]
-
-	var clause string
-	var args []interface{}
-
+	key := q.arg(prop)
+	text := fmt.Sprintf("%s->>%s", column, key)
 	switch op {
 	case "is_set":
-		clause = fmt.Sprintf("u.properties ? $%d", argIdx)
-		args = append(args, prop)
-		argIdx++
+		return fmt.Sprintf("%s ? %s", column, key), nil
 	case "is_not_set":
-		clause = fmt.Sprintf("NOT (u.properties ? $%d)", argIdx)
-		args = append(args, prop)
-		argIdx++
+		return fmt.Sprintf("NOT %s ? %s", column, key), nil
 	case "eq":
-		clause = fmt.Sprintf("u.properties->>$%d = $%d", argIdx, argIdx+1)
-		args = append(args, prop, fmt.Sprintf("%v", val))
-		argIdx += 2
+		return fmt.Sprintf("%s = %s", text, q.arg(fmt.Sprint(value))), nil
 	case "neq":
-		clause = fmt.Sprintf("(u.properties->>$%d IS NULL OR u.properties->>$%d != $%d)", argIdx, argIdx, argIdx+1)
-		args = append(args, prop, fmt.Sprintf("%v", val))
-		argIdx += 2
-	case "gt":
-		clause = fmt.Sprintf("(u.properties->>$%d)::numeric > $%d", argIdx, argIdx+1)
-		args = append(args, prop, val)
-		argIdx += 2
-	case "gte":
-		clause = fmt.Sprintf("(u.properties->>$%d)::numeric >= $%d", argIdx, argIdx+1)
-		args = append(args, prop, val)
-		argIdx += 2
-	case "lt":
-		clause = fmt.Sprintf("(u.properties->>$%d)::numeric < $%d", argIdx, argIdx+1)
-		args = append(args, prop, val)
-		argIdx += 2
-	case "lte":
-		clause = fmt.Sprintf("(u.properties->>$%d)::numeric <= $%d", argIdx, argIdx+1)
-		args = append(args, prop, val)
-		argIdx += 2
+		return fmt.Sprintf("%s IS DISTINCT FROM %s", text, q.arg(fmt.Sprint(value))), nil
 	case "contains":
-		clause = fmt.Sprintf("u.properties->>$%d ILIKE '%%' || $%d || '%%'", argIdx, argIdx+1)
-		args = append(args, prop, fmt.Sprintf("%v", val))
-		argIdx += 2
+		return fmt.Sprintf("%s ILIKE '%%' || %s || '%%'", text, q.arg(fmt.Sprint(value))), nil
 	case "not_contains":
-		clause = fmt.Sprintf("(u.properties->>$%d IS NULL OR u.properties->>$%d NOT ILIKE '%%' || $%d || '%%')", argIdx, argIdx, argIdx+1)
-		args = append(args, prop, fmt.Sprintf("%v", val))
-		argIdx += 2
-	default:
-		return "", nil, argIdx, fmt.Errorf("unknown operator: %s", op)
+		return fmt.Sprintf("COALESCE(%s NOT ILIKE '%%' || %s || '%%', TRUE)", text, q.arg(fmt.Sprint(value))), nil
+	case "gt", "gte", "lt", "lte":
+		n, err := toNumber(value)
+		if err != nil {
+			return "", fmt.Errorf("property %q: %w", prop, err)
+		}
+		// CASE guarantees non-numeric values are skipped instead of failing the cast.
+		return fmt.Sprintf("CASE WHEN jsonb_typeof(%s->%s) = 'number' THEN (%s)::numeric END %s %s",
+			column, key, text, comparisons[op], q.arg(n)), nil
 	}
-
-	return clause, args, argIdx, nil
+	return "", fmt.Errorf("property %q: invalid operator %q", prop, op)
 }
 
-func buildPropertyFilter(prop, op string, val interface{}, argIdx int) (string, []interface{}, int) {
-	var args []interface{}
-
-	switch op {
-	case "eq":
-		clause := fmt.Sprintf("e.properties->>$%d = $%d", argIdx, argIdx+1)
-		args = append(args, prop, fmt.Sprintf("%v", val))
-		return clause, args, argIdx + 2
-	case "neq":
-		clause := fmt.Sprintf("e.properties->>$%d != $%d", argIdx, argIdx+1)
-		args = append(args, prop, fmt.Sprintf("%v", val))
-		return clause, args, argIdx + 2
-	case "gt":
-		clause := fmt.Sprintf("(e.properties->>$%d)::numeric > $%d", argIdx, argIdx+1)
-		args = append(args, prop, val)
-		return clause, args, argIdx + 2
-	case "gte":
-		clause := fmt.Sprintf("(e.properties->>$%d)::numeric >= $%d", argIdx, argIdx+1)
-		args = append(args, prop, val)
-		return clause, args, argIdx + 2
-	case "lt":
-		clause := fmt.Sprintf("(e.properties->>$%d)::numeric < $%d", argIdx, argIdx+1)
-		args = append(args, prop, val)
-		return clause, args, argIdx + 2
-	case "lte":
-		clause := fmt.Sprintf("(e.properties->>$%d)::numeric <= $%d", argIdx, argIdx+1)
-		args = append(args, prop, val)
-		return clause, args, argIdx + 2
-	case "contains":
-		clause := fmt.Sprintf("e.properties->>$%d ILIKE '%%' || $%d || '%%'", argIdx, argIdx+1)
-		args = append(args, prop, fmt.Sprintf("%v", val))
-		return clause, args, argIdx + 2
-	case "not_contains":
-		clause := fmt.Sprintf("e.properties->>$%d NOT ILIKE '%%' || $%d || '%%'", argIdx, argIdx+1)
-		args = append(args, prop, fmt.Sprintf("%v", val))
-		return clause, args, argIdx + 2
-	case "is_set":
-		clause := fmt.Sprintf("e.properties ? $%d", argIdx)
-		args = append(args, prop)
-		return clause, args, argIdx + 1
-	case "is_not_set":
-		clause := fmt.Sprintf("NOT (e.properties ? $%d)", argIdx)
-		args = append(args, prop)
-		return clause, args, argIdx + 1
-	}
-
-	return "", nil, argIdx
-}
-
-func mapComparisonOperator(op string) string {
-	switch op {
-	case "eq":
-		return "="
-	case "neq":
-		return "!="
-	case "gt":
-		return ">"
-	case "gte":
-		return ">="
-	case "lt":
-		return "<"
-	case "lte":
-		return "<="
-	default:
-		return ">="
-	}
-}
-
-func mapTimeWindowToInterval(tw string) string {
-	switch tw {
-	case "1h":
-		return "1 hour"
-	case "24h":
-		return "24 hours"
-	case "7d":
-		return "7 days"
-	case "30d":
-		return "30 days"
-	case "90d":
-		return "90 days"
-	default:
-		return ""
-	}
-}
-
-func getFloat64(m map[string]interface{}, key string) float64 {
-	if v, ok := m[key]; ok {
-		switch val := v.(type) {
-		case float64:
-			return val
-		case int:
-			return float64(val)
-		case int64:
-			return float64(val)
+func toNumber(v interface{}) (float64, error) {
+	switch n := v.(type) {
+	case float64:
+		return n, nil
+	case string:
+		if f, err := strconv.ParseFloat(n, 64); err == nil {
+			return f, nil
 		}
 	}
-	return 0
+	return 0, fmt.Errorf("%v is not a number", v)
 }

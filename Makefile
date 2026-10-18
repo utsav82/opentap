@@ -1,4 +1,7 @@
-.PHONY: dev api worker migrate test lint build-api build-worker
+-include .env
+export
+
+.PHONY: dev api worker dashboard test lint build-api build-worker
 
 dev:
 	docker compose -f docker-compose.dev.yml up -d
@@ -9,11 +12,8 @@ api:
 worker:
 	go run cmd/worker/main.go
 
-migrate:
-	@for f in migrations/*.sql; do \
-		echo "Running $$f..."; \
-		psql $(DATABASE_URL) -f $$f; \
-	done
+dashboard:
+	cd dashboard && npm install && npm run dev
 
 test:
 	go test ./... -v -count=1

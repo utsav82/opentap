@@ -6,6 +6,7 @@ import { UserList, UserDetail } from './pages/UsersPage';
 import { SegmentList, SegmentDetail } from './pages/SegmentsPage';
 import { SchemaList, SchemaDetail } from './pages/SchemasPage';
 import SettingsPage from './pages/SettingsPage';
+import AnalyticsPage from './pages/AnalyticsPage';
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
           <Route path="/events/:id" element={<EventDetail />} />
           <Route path="/users" element={<UserList />} />
           <Route path="/users/:id" element={<UserDetail />} />
+          <Route path="/analytics" element={<AnalyticsPage />} />
           <Route path="/segments" element={<SegmentList />} />
           <Route path="/segments/:id" element={<SegmentDetail />} />
           <Route path="/schemas" element={<SchemaList />} />

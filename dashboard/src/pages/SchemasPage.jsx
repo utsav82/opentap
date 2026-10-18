@@ -1,20 +1,21 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api } from '../lib/api';
-import { Card, PageHeader, LoadingSpinner, EmptyState, Badge } from '../components/Card';
+import { Card, PageHeader, LoadingSpinner, EmptyState, Badge, ErrorMessage } from '../components/Card';
 
 function SchemaDetail() {
   const { eventName } = useParams();
   const navigate = useNavigate();
   const [schema, setSchema] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
-    api.getSchema(eventName).then(setSchema).catch(() => {}).finally(() => setLoading(false));
+    api.getSchema(eventName).then(setSchema).catch((err) => setError(err.message)).finally(() => setLoading(false));
   }, [eventName]);
 
   if (loading) return <LoadingSpinner />;
-  if (!schema) return <EmptyState message="Schema not found" />;
+  if (!schema) return <ErrorMessage error={error} />;
 
   return (
     <div>
@@ -56,17 +57,19 @@ function SchemaList() {
   const navigate = useNavigate();
   const [schemas, setSchemas] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
   useEffect(() => {
     api.listSchemas()
       .then((res) => setSchemas(res?.data || []))
-      .catch(() => {})
+      .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
   }, []);
 
   return (
     <div>
       <PageHeader title="Schemas" description="Auto-discovered event types and properties" />
+      <ErrorMessage error={error} />
       <Card>
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -80,7 +83,7 @@ function SchemaList() {
             </thead>
             <tbody>
               {schemas.map((s) => (
-                <tr key={s.event_name} onClick={() => navigate(`/schemas/${s.event_name}`)} className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer transition-colors">
+                <tr key={s.event_name} onClick={() => navigate(`/schemas/${encodeURIComponent(s.event_name)}`)} className="border-b border-gray-100 hover:bg-gray-50 cursor-pointer transition-colors">
                   <td className="p-4 font-mono text-sm font-medium text-gray-900">{s.event_name}</td>
                   <td className="p-4 text-gray-600">{s.property_count}</td>
                   <td className="p-4 text-gray-500 text-xs">{new Date(s.first_seen).toLocaleDateString()}</td>
@@ -91,7 +94,7 @@ function SchemaList() {
           </table>
         </div>
         {loading && <LoadingSpinner />}
-        {!loading && schemas.length === 0 && <EmptyState message="No event schemas discovered yet. Start sending events!" />}
+        {!loading && !error && schemas.length === 0 && <EmptyState message="No event schemas discovered yet. Start sending events!" />}
       </Card>
     </div>
   );

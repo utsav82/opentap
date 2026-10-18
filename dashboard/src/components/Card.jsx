@@ -51,6 +51,15 @@ export function EmptyState({ message }) {
   );
 }
 
+export function ErrorMessage({ error }) {
+  if (!error) return null;
+  return (
+    <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+      {error}
+    </div>
+  );
+}
+
 export function LoadingSpinner() {
   return (
     <div className="flex justify-center py-12">
